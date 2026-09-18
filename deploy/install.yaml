@@ -1,0 +1,288 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monosi-system
+  labels:
+    app.kubernetes.io/name: monosi
+    control-plane: controller-manager
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
+  name: shuffleshardassignments.sharding.monosi.io
+spec:
+  group: sharding.monosi.io
+  names:
+    kind: ShuffleShardAssignment
+    listKind: ShuffleShardAssignmentList
+    plural: shuffleshardassignments
+    singular: shuffleshardassignment
+    shortNames:
+      - ssa
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Tenant
+          type: string
+          jsonPath: .spec.tenantID
+        - name: AssignedShards
+          type: string
+          jsonPath: .status.assignedShards
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: ShuffleShardAssignment manages deterministic shard assignment for multi-tenant workload isolation.
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - tenantID
+              x-kubernetes-validations:
+                - rule: "self.shardPoolSize >= 1"
+                  message: "shardPoolSize must be at least 1"
+                - rule: "self.shardsPerTenant >= 1"
+                  message: "shardsPerTenant must be at least 1"
+                - rule: "self.shardsPerTenant <= self.shardPoolSize"
+                  message: "shardsPerTenant cannot exceed shardPoolSize"
+                - rule: "size(self.tenantID) > 0"
+                  message: "tenantID must not be empty"
+              properties:
+                tenantID:
+                  type: string
+                  minLength: 1
+                  description: Unique identifier for the tenant, used to deterministically seed shard selection.
+                shardPoolSize:
+                  type: integer
+                  minimum: 1
+                  default: 8
+                  description: Total pool size (N) of shards.
+                shardsPerTenant:
+                  type: integer
+                  minimum: 1
+                  default: 2
+                  description: Number of shards (k) assigned to this tenant.
+                nodeSelectorKey:
+                  type: string
+                  default: topology.kubernetes.io/shard
+                  description: Node label key used to define shard membership.
+                targetWorkload:
+                  type: object
+                  required:
+                    - name
+                  properties:
+                    apiVersion:
+                      type: string
+                      description: APIVersion of the target workload (default apps/v1).
+                    kind:
+                      type: string
+                      default: Deployment
+                      description: Kind of the target workload.
+                    name:
+                      type: string
+                      description: Name of the target workload.
+                    namespace:
+                      type: string
+                      description: Namespace of the target workload (defaults to CR namespace).
+            status:
+              type: object
+              properties:
+                assignedShards:
+                  type: array
+                  items:
+                    type: integer
+                  description: Deterministically assigned shard indices.
+                phase:
+                  type: string
+                  description: Phase of the assignment (Assigned, Failed).
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastReconciled:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: monosi-controller-manager
+  namespace: monosi-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monosi-manager-role
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - sharding.monosi.io
+    resources:
+      - shuffleshardassignments
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - sharding.monosi.io
+    resources:
+      - shuffleshardassignments/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - sharding.monosi.io
+    resources:
+      - shuffleshardassignments/status
+    verbs:
+      - get
+      - patch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: monosi-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: monosi-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: monosi-controller-manager
+    namespace: monosi-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monosi-controller-manager
+  namespace: monosi-system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: monosi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: monosi
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: monosi
+    spec:
+      serviceAccountName: monosi-controller-manager
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: ghcr.io/sodiqscript111/monosi:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /manager
+          args:
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --leader-elect
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi

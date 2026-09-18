@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "monosi.io/shuffle-sharding-controller/api/v1alpha1"
@@ -22,6 +23,7 @@ import (
 )
 
 const (
+	FinalizerName          = "sharding.monosi.io/finalizer"
 	DefaultNodeSelectorKey = "topology.kubernetes.io/shard"
 	DefaultShardPoolSize   = 8
 	DefaultShardsPerTenant = 2
@@ -49,6 +51,27 @@ func (r *ShuffleShardAssignmentReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
+	if !assignment.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&assignment, FinalizerName) {
+			if err := r.cleanupTargetWorkload(ctx, &assignment); err != nil {
+				reqLog.Error(err, "failed to cleanup target workload on deletion")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+			controllerutil.RemoveFinalizer(&assignment, FinalizerName)
+			if err := r.Update(ctx, &assignment); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(&assignment, FinalizerName) {
+		controllerutil.AddFinalizer(&assignment, FinalizerName)
+		if err := r.Update(ctx, &assignment); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	poolSize := assignment.Spec.ShardPoolSize
 	if poolSize <= 0 {
 		poolSize = DefaultShardPoolSize
@@ -65,16 +88,23 @@ func (r *ShuffleShardAssignmentReconciler) Reconcile(ctx context.Context, req ct
 	assignedShards, err := sharder.ComputeAssignment(assignment.Spec.TenantID, poolSize, shardsPerTenant)
 	if err != nil {
 		reqLog.Error(err, "failed to compute deterministic shard assignment", "tenantID", assignment.Spec.TenantID)
-		r.setCondition(&assignment, metav1.Condition{
+		changed := r.setCondition(&assignment, metav1.Condition{
 			Type:               ConditionTypeReady,
 			Status:             metav1.ConditionFalse,
 			Reason:             "CalculationFailed",
 			Message:            err.Error(),
 			ObservedGeneration: assignment.Generation,
 		})
-		assignment.Status.Phase = "Failed"
-		if updateErr := r.Status().Update(ctx, &assignment); updateErr != nil {
-			return ctrl.Result{}, updateErr
+		if assignment.Status.Phase != "Failed" {
+			assignment.Status.Phase = "Failed"
+			changed = true
+		}
+		if changed {
+			now := metav1.Now()
+			assignment.Status.LastReconciled = &now
+			if updateErr := r.Status().Update(ctx, &assignment); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
 		}
 		return ctrl.Result{}, nil
 	}
@@ -93,37 +123,46 @@ func (r *ShuffleShardAssignmentReconciler) Reconcile(ctx context.Context, req ct
 		statusChanged = true
 	}
 
-	r.setCondition(&assignment, metav1.Condition{
+	if r.setCondition(&assignment, metav1.Condition{
 		Type:               ConditionTypeReady,
 		Status:             metav1.ConditionTrue,
 		Reason:             "ShardsAssigned",
 		Message:            fmt.Sprintf("Tenant deterministically assigned to shards: %v", assignedShards),
 		ObservedGeneration: assignment.Generation,
-	})
-	statusChanged = true
+	}) {
+		statusChanged = true
+	}
 
 	if assignment.Spec.TargetWorkload != nil {
 		workloadErr := r.reconcileTargetWorkload(ctx, &assignment, assignedShards, nodeKey)
 		if workloadErr != nil {
 			reqLog.Error(workloadErr, "failed to apply shard placement to target workload")
-			r.setCondition(&assignment, metav1.Condition{
+			if r.setCondition(&assignment, metav1.Condition{
 				Type:               ConditionWorkloadOK,
 				Status:             metav1.ConditionFalse,
 				Reason:             "WorkloadUpdateFailed",
 				Message:            workloadErr.Error(),
 				ObservedGeneration: assignment.Generation,
-			})
-			_ = r.Status().Update(ctx, &assignment)
+			}) {
+				statusChanged = true
+			}
+			if statusChanged {
+				now := metav1.Now()
+				assignment.Status.LastReconciled = &now
+				_ = r.Status().Update(ctx, &assignment)
+			}
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, workloadErr
 		}
 
-		r.setCondition(&assignment, metav1.Condition{
+		if r.setCondition(&assignment, metav1.Condition{
 			Type:               ConditionWorkloadOK,
 			Status:             metav1.ConditionTrue,
 			Reason:             "WorkloadConfigured",
 			Message:            fmt.Sprintf("Workload %s configured with shards %v", assignment.Spec.TargetWorkload.Name, assignedShards),
 			ObservedGeneration: assignment.Generation,
-		})
+		}) {
+			statusChanged = true
+		}
 	}
 
 	if statusChanged {
@@ -136,6 +175,113 @@ func (r *ShuffleShardAssignmentReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *ShuffleShardAssignmentReconciler) cleanupTargetWorkload(
+	ctx context.Context,
+	assignment *v1alpha1.ShuffleShardAssignment,
+) error {
+	target := assignment.Spec.TargetWorkload
+	if target == nil {
+		return nil
+	}
+
+	targetNamespace := target.Namespace
+	if targetNamespace == "" {
+		targetNamespace = assignment.Namespace
+	}
+
+	kind := target.Kind
+	if kind == "" {
+		kind = "Deployment"
+	}
+	if kind != "Deployment" {
+		return nil
+	}
+
+	var deploy appsv1.Deployment
+	deployKey := types.NamespacedName{Namespace: targetNamespace, Name: target.Name}
+	if err := r.Get(ctx, deployKey, &deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	nodeKey := assignment.Spec.NodeSelectorKey
+	if nodeKey == "" {
+		nodeKey = DefaultNodeSelectorKey
+	}
+
+	modified := false
+
+	if deploy.Spec.Template.Labels != nil {
+		if _, ok := deploy.Spec.Template.Labels[LabelTenant]; ok {
+			delete(deploy.Spec.Template.Labels, LabelTenant)
+			modified = true
+		}
+		if _, ok := deploy.Spec.Template.Labels[LabelSharded]; ok {
+			delete(deploy.Spec.Template.Labels, LabelSharded)
+			modified = true
+		}
+	}
+	if deploy.Spec.Template.Annotations != nil {
+		if _, ok := deploy.Spec.Template.Annotations[AnnotationShards]; ok {
+			delete(deploy.Spec.Template.Annotations, AnnotationShards)
+			modified = true
+		}
+	}
+
+	podSpec := &deploy.Spec.Template.Spec
+	if podSpec.Affinity != nil && podSpec.Affinity.NodeAffinity != nil &&
+		podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		nodeSelector := podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		var newTerms []corev1.NodeSelectorTerm
+		for _, term := range nodeSelector.NodeSelectorTerms {
+			var newExprs []corev1.NodeSelectorRequirement
+			for _, expr := range term.MatchExpressions {
+				if expr.Key != nodeKey {
+					newExprs = append(newExprs, expr)
+				} else {
+					modified = true
+				}
+			}
+			if len(newExprs) > 0 || len(term.MatchFields) > 0 {
+				term.MatchExpressions = newExprs
+				newTerms = append(newTerms, term)
+			} else {
+				modified = true
+			}
+		}
+		nodeSelector.NodeSelectorTerms = newTerms
+		if len(newTerms) == 0 {
+			podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
+			if podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution == nil {
+				podSpec.Affinity.NodeAffinity = nil
+			}
+			if podSpec.Affinity.PodAffinity == nil && podSpec.Affinity.PodAntiAffinity == nil && podSpec.Affinity.NodeAffinity == nil {
+				podSpec.Affinity = nil
+			}
+		}
+	}
+
+	if len(podSpec.Tolerations) > 0 {
+		var newTols []corev1.Toleration
+		for _, tol := range podSpec.Tolerations {
+			if tol.Key == nodeKey {
+				modified = true
+			} else {
+				newTols = append(newTols, tol)
+			}
+		}
+		podSpec.Tolerations = newTols
+	}
+
+	if modified {
+		return r.Update(ctx, &deploy)
+	}
+
+	return nil
 }
 
 func (r *ShuffleShardAssignmentReconciler) reconcileTargetWorkload(
@@ -276,18 +422,20 @@ func (r *ShuffleShardAssignmentReconciler) reconcileTargetWorkload(
 	return nil
 }
 
-func (r *ShuffleShardAssignmentReconciler) setCondition(assignment *v1alpha1.ShuffleShardAssignment, newCond metav1.Condition) {
-	newCond.LastTransitionTime = metav1.Now()
+func (r *ShuffleShardAssignmentReconciler) setCondition(assignment *v1alpha1.ShuffleShardAssignment, newCond metav1.Condition) bool {
 	for i, cond := range assignment.Status.Conditions {
 		if cond.Type == newCond.Type {
 			if cond.Status == newCond.Status && cond.Reason == newCond.Reason && cond.Message == newCond.Message {
-				return
+				return false
 			}
+			newCond.LastTransitionTime = metav1.Now()
 			assignment.Status.Conditions[i] = newCond
-			return
+			return true
 		}
 	}
+	newCond.LastTransitionTime = metav1.Now()
 	assignment.Status.Conditions = append(assignment.Status.Conditions, newCond)
+	return true
 }
 
 func (r *ShuffleShardAssignmentReconciler) SetupWithManager(mgr ctrl.Manager) error {

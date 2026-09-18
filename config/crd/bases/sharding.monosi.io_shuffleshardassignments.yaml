@@ -48,6 +48,15 @@ spec:
               type: object
               required:
                 - tenantID
+              x-kubernetes-validations:
+                - rule: "self.shardPoolSize >= 1"
+                  message: "shardPoolSize must be at least 1"
+                - rule: "self.shardsPerTenant >= 1"
+                  message: "shardsPerTenant must be at least 1"
+                - rule: "self.shardsPerTenant <= self.shardPoolSize"
+                  message: "shardsPerTenant cannot exceed shardPoolSize"
+                - rule: "size(self.tenantID) > 0"
+                  message: "tenantID must not be empty"
               properties:
                 tenantID:
                   type: string

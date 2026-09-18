@@ -114,38 +114,13 @@ To ensure the reconciler produces identical assignments across controller restar
 
 ---
 
-## 5. Kubernetes Node Scheduling Mechanism
+## 5. Kubernetes Workload Scheduling & Deletion Lifecycle
 
 The controller maps the assigned shards to Kubernetes nodes using **Node Affinity** and **Tolerations**.
 
-### 1. Node Labeling
-Nodes in the cluster are labeled according to their shard ID:
-```bash
-kubectl label node node-1 topology.kubernetes.io/shard=0
-kubectl label node node-2 topology.kubernetes.io/shard=1
-# ...
-kubectl label node node-8 topology.kubernetes.io/shard=7
-```
-Optionally, shard nodes can be tainted to prevent non-sharded workloads from polluting them:
-```bash
-kubectl taint node node-1 topology.kubernetes.io/shard=0:NoSchedule
-```
-
-### 2. Workload Reconciliation
-When a `ShuffleShardAssignment` specifies `targetWorkload` (e.g. a Deployment), the controller automatically updates the Deployment:
-1. **Node Affinity**: Injects `requiredDuringSchedulingIgnoredDuringExecution` requiring `topology.kubernetes.io/shard In [<assignedShards>]`:
-   ```yaml
-   affinity:
-     nodeAffinity:
-       requiredDuringSchedulingIgnoredDuringExecution:
-         nodeSelectorTerms:
-         - matchExpressions:
-           - key: topology.kubernetes.io/shard
-             operator: In
-             values:
-             - "2"
-             - "7"
-   ```
+### 1. Workload Reconciliation
+When a `ShuffleShardAssignment` specifies `targetWorkload` (e.g. a Deployment), the controller updates the Deployment:
+1. **Node Affinity**: Injects `requiredDuringSchedulingIgnoredDuringExecution` requiring `topology.kubernetes.io/shard In [<assignedShards>]`.
 2. **Tolerations**: Injects tolerations for the assigned shards:
    ```yaml
    tolerations:
@@ -153,23 +128,48 @@ When a `ShuffleShardAssignment` specifies `targetWorkload` (e.g. a Deployment), 
      operator: Equal
      value: "2"
      effect: NoSchedule
-   - key: topology.kubernetes.io/shard
-     operator: Equal
-     value: "7"
-     effect: NoSchedule
    ```
-3. **Labels & Annotations**: Injects tenant tracking labels:
-   ```yaml
-   labels:
-     sharding.monosi.io/tenant: "tenant-alpha"
-     sharding.monosi.io/sharded: "true"
-   annotations:
-     sharding.monosi.io/assigned-shards: "2,7"
-   ```
+3. **Labels & Annotations**: Injects tenant tracking labels (`sharding.monosi.io/tenant`, `sharding.monosi.io/sharded`, `sharding.monosi.io/assigned-shards`).
+
+### 2. Finalizer & Deletion Cleanup
+To prevent orphaned scheduling constraints when a `ShuffleShardAssignment` is deleted:
+- The controller registers a finalizer `sharding.monosi.io/finalizer` upon creation.
+- On deletion (`DeletionTimestamp != nil`), the controller intercepts the event, fetches the target `Deployment`, and strips:
+  - The injected `NodeAffinity` selector terms for the shard key.
+  - The injected `Tolerations` for the shard key.
+  - The injected `sharding.monosi.io/*` labels and annotations.
+- Only after the target workload is restored to an unconstrained state does the controller remove the finalizer, allowing garbage collection to proceed cleanly.
+
+### 3. Reconcile Loop Protection
+The controller tracks status conditions and generation state with diff guards to ensure status writes only occur when state actually changes, preventing runaway hot reconcile loops.
 
 ---
 
-## 6. Custom Resource Definition (CRD)
+## 6. Apply-Time Validation (CEL & Admission Webhook)
+
+Invalid specifications (e.g., `shardsPerTenant > shardPoolSize`, `shardPoolSize < 1`, or empty `tenantID`) are prevented at `kubectl apply` time through two complementary layers:
+
+1. **Declarative CEL Rules in CRD Schema**:
+   The CRD includes `x-kubernetes-validations` directly in the OpenAPI schema:
+   ```yaml
+   x-kubernetes-validations:
+     - rule: "self.shardsPerTenant <= self.shardPoolSize"
+       message: "shardsPerTenant cannot exceed shardPoolSize"
+     - rule: "self.shardsPerTenant >= 1"
+       message: "shardsPerTenant must be at least 1"
+     - rule: "self.shardPoolSize >= 1"
+       message: "shardPoolSize must be at least 1"
+     - rule: "size(self.tenantID) > 0"
+       message: "tenantID must not be empty"
+   ```
+   This rejects invalid resources at the API server before they are ever stored.
+
+2. **Validating Admission Webhook**:
+   A controller-runtime admission webhook is implemented in `api/v1alpha1/shuffleshardassignment_webhook.go` and can be enabled via `--enable-webhook`.
+
+---
+
+## 7. Custom Resource Definition (CRD)
 
 ### Spec
 - `tenantID` (`string`, required): Unique identifier for the tenant.
@@ -187,46 +187,6 @@ When a `ShuffleShardAssignment` specifies `targetWorkload` (e.g. a Deployment), 
 
 ---
 
-## 7. Example Manifest
-
-```yaml
-apiVersion: sharding.monosi.io/v1alpha1
-kind: ShuffleShardAssignment
-metadata:
-  name: tenant-alpha-shards
-  namespace: default
-spec:
-  tenantID: "tenant-alpha"
-  shardPoolSize: 8
-  shardsPerTenant: 2
-  nodeSelectorKey: "topology.kubernetes.io/shard"
-  targetWorkload:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: tenant-alpha-service
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tenant-alpha-service
-  namespace: default
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: tenant-alpha-service
-  template:
-    metadata:
-      labels:
-        app: tenant-alpha-service
-    spec:
-      containers:
-      - name: app
-        image: registry.k8s.io/pause:3.9
-```
-
----
-
 ## 8. Verification & Running Tests
 
 ### Run Unit Tests
@@ -238,4 +198,5 @@ The test suite covers:
 - **Assignment Stability**: 500 repeated iterations per tenant asserting 100% reproducible assignments across reconciler invocations.
 - **Even Distribution**: 20,000 synthetic tenants evaluated over $N=8, k=2$; asserts empirical frequencies cluster evenly around the expected 25% ($\pm 3\%$).
 - **Pairwise Overlap Bounds**: 124,750 tenant pairs evaluated; verifies that distinct assignments share at most 1 shard.
-- **Controller Reconciler**: Fake client tests verifying CR status updates, Deployment NodeAffinity injection, tolerations injection, and idempotence.
+- **Controller Reconciler**: Fake client tests verifying CR status updates, Deployment NodeAffinity injection, tolerations injection, hot-loop protection, and finalizer-based cleanup on deletion.
+- **Admission Webhook**: Validates rejection of invalid configurations ($k > N$, empty tenant, $N < 1$) on create and update.

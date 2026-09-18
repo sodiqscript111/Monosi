@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	v1alpha1 "monosi.io/shuffle-sharding-controller/api/v1alpha1"
 )
@@ -78,6 +80,10 @@ func TestReconcileBasicAssignment(t *testing.T) {
 		t.Fatalf("failed to get updated assignment: %v", err)
 	}
 
+	if !controllerutil.ContainsFinalizer(&updated, FinalizerName) {
+		t.Errorf("expected finalizer %s to be present", FinalizerName)
+	}
+
 	if len(updated.Status.AssignedShards) != 2 {
 		t.Fatalf("expected 2 assigned shards, got %v", updated.Status.AssignedShards)
 	}
@@ -86,6 +92,9 @@ func TestReconcileBasicAssignment(t *testing.T) {
 	}
 
 	assignedInitial := updated.Status.AssignedShards
+	lastReconciled := updated.Status.LastReconciled
+
+	time.Sleep(10 * time.Millisecond)
 
 	res2, err := reconciler.Reconcile(ctx, req)
 	if err != nil {
@@ -106,9 +115,14 @@ func TestReconcileBasicAssignment(t *testing.T) {
 		t.Errorf("assignment changed across reconciles: was %v, now %v",
 			assignedInitial, updated2.Status.AssignedShards)
 	}
+
+	if updated2.Status.LastReconciled.Time != lastReconciled.Time {
+		t.Errorf("status was unnecessarily updated without changes: was %v, now %v",
+			lastReconciled.Time, updated2.Status.LastReconciled.Time)
+	}
 }
 
-func TestReconcileWithTargetDeployment(t *testing.T) {
+func TestReconcileWithTargetDeploymentAndCleanup(t *testing.T) {
 	scheme := setupTestScheme(t)
 
 	deploy := &appsv1.Deployment{
@@ -245,6 +259,50 @@ func TestReconcileWithTargetDeployment(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("missing expected toleration for shard %s", shardStr)
+		}
+	}
+
+	if err := client.Delete(ctx, &updatedCR); err != nil {
+		t.Fatalf("failed to delete assignment: %v", err)
+	}
+
+	delRes, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile on deletion failed: %v", err)
+	}
+	if delRes.Requeue {
+		t.Errorf("unexpected requeue on deletion: %v", delRes)
+	}
+
+	var cleanedDeploy appsv1.Deployment
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "tenant-alpha-worker"}, &cleanedDeploy); err != nil {
+		t.Fatalf("failed to fetch cleaned deployment: %v", err)
+	}
+
+	if _, ok := cleanedDeploy.Spec.Template.Labels[LabelTenant]; ok {
+		t.Errorf("expected LabelTenant to be removed on deletion")
+	}
+	if _, ok := cleanedDeploy.Spec.Template.Labels[LabelSharded]; ok {
+		t.Errorf("expected LabelSharded to be removed on deletion")
+	}
+	if _, ok := cleanedDeploy.Spec.Template.Annotations[AnnotationShards]; ok {
+		t.Errorf("expected AnnotationShards to be removed on deletion")
+	}
+	if cleanedDeploy.Spec.Template.Spec.Affinity != nil && cleanedDeploy.Spec.Template.Spec.Affinity.NodeAffinity != nil {
+		if cleanedDeploy.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+			t.Errorf("expected NodeAffinity to be removed on deletion")
+		}
+	}
+	for _, tol := range cleanedDeploy.Spec.Template.Spec.Tolerations {
+		if tol.Key == "sharding.monosi.io/shard" {
+			t.Errorf("expected toleration for sharding.monosi.io/shard to be removed on deletion")
+		}
+	}
+
+	var finalCR v1alpha1.ShuffleShardAssignment
+	if err := client.Get(ctx, req.NamespacedName, &finalCR); err == nil {
+		if controllerutil.ContainsFinalizer(&finalCR, FinalizerName) {
+			t.Errorf("expected finalizer to be removed after cleanup")
 		}
 	}
 }

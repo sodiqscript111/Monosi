@@ -187,7 +187,21 @@ Invalid specifications (e.g., `shardsPerTenant > shardPoolSize`, `shardPoolSize 
 
 ---
 
-## 8. Verification & Running Tests
+## 8. Installation
+
+Deploy the Monosi operator directly into your Kubernetes cluster:
+```bash
+kubectl apply -f https://raw.githubusercontent.com/sodiqscript111/Monosi/main/deploy/install.yaml
+```
+
+Verify that the operator is running:
+```bash
+kubectl get pods -n monosi-system
+```
+
+---
+
+## 9. Verification & Running Tests
 
 ### Run Unit Tests
 ```bash

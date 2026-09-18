@@ -1,0 +1,129 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
+  name: shuffleshardassignments.sharding.monosi.io
+spec:
+  group: sharding.monosi.io
+  names:
+    kind: ShuffleShardAssignment
+    listKind: ShuffleShardAssignmentList
+    plural: shuffleshardassignments
+    singular: shuffleshardassignment
+    shortNames:
+      - ssa
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Tenant
+          type: string
+          jsonPath: .spec.tenantID
+        - name: AssignedShards
+          type: string
+          jsonPath: .status.assignedShards
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          description: ShuffleShardAssignment manages deterministic shard assignment for multi-tenant workload isolation.
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - tenantID
+              properties:
+                tenantID:
+                  type: string
+                  minLength: 1
+                  description: Unique identifier for the tenant, used to deterministically seed shard selection.
+                shardPoolSize:
+                  type: integer
+                  minimum: 1
+                  default: 8
+                  description: Total pool size (N) of shards.
+                shardsPerTenant:
+                  type: integer
+                  minimum: 1
+                  default: 2
+                  description: Number of shards (k) assigned to this tenant.
+                nodeSelectorKey:
+                  type: string
+                  default: topology.kubernetes.io/shard
+                  description: Node label key used to define shard membership.
+                targetWorkload:
+                  type: object
+                  required:
+                    - name
+                  properties:
+                    apiVersion:
+                      type: string
+                      description: APIVersion of the target workload (default apps/v1).
+                    kind:
+                      type: string
+                      default: Deployment
+                      description: Kind of the target workload.
+                    name:
+                      type: string
+                      description: Name of the target workload.
+                    namespace:
+                      type: string
+                      description: Namespace of the target workload (defaults to CR namespace).
+            status:
+              type: object
+              properties:
+                assignedShards:
+                  type: array
+                  items:
+                    type: integer
+                  description: Deterministically assigned shard indices.
+                phase:
+                  type: string
+                  description: Phase of the assignment (Assigned, Failed).
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastReconciled:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64

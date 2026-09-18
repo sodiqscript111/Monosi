@@ -1,0 +1,55 @@
+apiVersion: sharding.monosi.io/v1alpha1
+kind: ShuffleShardAssignment
+metadata:
+  name: tenant-alpha-shards
+  namespace: default
+spec:
+  tenantID: "tenant-alpha"
+  shardPoolSize: 8
+  shardsPerTenant: 2
+  nodeSelectorKey: "topology.kubernetes.io/shard"
+  targetWorkload:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tenant-alpha-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tenant-alpha-service
+  namespace: default
+  labels:
+    app: tenant-alpha-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tenant-alpha-service
+  template:
+    metadata:
+      labels:
+        app: tenant-alpha-service
+    spec:
+      containers:
+      - name: app
+        image: registry.k8s.io/pause:3.9
+---
+apiVersion: sharding.monosi.io/v1alpha1
+kind: ShuffleShardAssignment
+metadata:
+  name: tenant-bravo-shards
+  namespace: default
+spec:
+  tenantID: "tenant-bravo"
+  shardPoolSize: 8
+  shardsPerTenant: 2
+---
+apiVersion: sharding.monosi.io/v1alpha1
+kind: ShuffleShardAssignment
+metadata:
+  name: tenant-charlie-shards
+  namespace: default
+spec:
+  tenantID: "tenant-charlie"
+  shardPoolSize: 8
+  shardsPerTenant: 2
